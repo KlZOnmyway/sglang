@@ -266,6 +266,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
 
+    # Optional auxiliary ngram input ids (e.g., EAGLE3), shape: [B, S, 3]
+    ngram_input_ids: Optional[torch.Tensor] = None
+
     # For logprob
     return_logprob: bool = False
     top_logprobs_nums: Optional[List[int]] = None
@@ -385,6 +388,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
             input_ids=batch.input_ids,
+            ngram_input_ids=getattr(batch.spec_info, "ngram_input_ids", None),
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
