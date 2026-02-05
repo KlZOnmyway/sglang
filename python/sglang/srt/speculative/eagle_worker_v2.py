@@ -421,6 +421,7 @@ class EagleDraftWorker(BaseDraftWorker):
                     prev_step_input_ids=prev_step_input_ids_2d,
                 )
                 spec_info.ngram_input_ids = ngram_input_ids
+                forward_batch.ngram_input_ids = ngram_input_ids
                 prev_step_input_ids_2d = input_ids.reshape(forward_batch.batch_size, -1)
 
             score_list.append(tree_info[0])
@@ -520,26 +521,20 @@ class EagleDraftWorker(BaseDraftWorker):
             if req_tokens.numel() == 0:
                 continue
 
-            # Reset when there is no committed history before current request segment.
-            # `seq_lens[i]` is the total sequence length represented in this batch and
-            # `req_tokens.numel()` is the number of current-step input tokens for this req.
-            # If `seq_lens[i] - req_tokens.numel() <= 0`, there are no previous tokens,
-            # so we must not reuse any stale history from req-pool slot reuse.
-            num_prev_tokens = (
-                int(seq_lens[i]) - req_tokens.numel() if seq_lens is not None else None
-            )
-            if num_prev_tokens is not None and num_prev_tokens <= 0:
-                prev_two = torch.tensor(
-                    [-1, -1], dtype=torch.int64, device=input_ids.device
-                )
-            else:
-                prev_two = self.eagle3_prev_two_token_ids_by_req.get(req_pool_idx)
-                if prev_two is None:
-                    prev_two = torch.tensor(
-                        [-1, -1], dtype=torch.int64, device=input_ids.device
-                    )
+            prev_two = self.eagle3_prev_two_token_ids_by_req.get(req_pool_idx)
+            if prev_two is None:
+                # First time seeing this request in this worker: initialize directly
+                # from the current request segment (typically prefill/extend tokens).
+                if req_tokens.numel() >= 2:
+                    prev_two = req_tokens[-2:].to(dtype=torch.int64)
                 else:
-                    prev_two = prev_two.to(device=input_ids.device, dtype=torch.int64)
+                    prev_two = torch.tensor(
+                        [-1, req_tokens[-1]], dtype=torch.int64, device=input_ids.device
+                    )
+                self.eagle3_prev_two_token_ids_by_req[req_pool_idx] = prev_two
+                continue
+
+            prev_two = prev_two.to(device=input_ids.device, dtype=torch.int64)
 
             for token_id in req_tokens:
                 prev_two = torch.stack([prev_two[1], token_id])
