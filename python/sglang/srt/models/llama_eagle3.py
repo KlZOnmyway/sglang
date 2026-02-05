@@ -151,7 +151,22 @@ class LlamaModel(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if input_embeds is None:
-            embeds = self.embed_tokens(input_ids)
+            if (
+                forward_batch.ngram_input_ids is not None
+                and forward_batch.ngram_input_ids.numel() > 0
+            ):
+                # Optional EAGLE3 ngram path: [B, S, 3] -> [B*S, 3, H] -> [B*S, H].
+                # Keep original input_ids path as fallback to avoid breaking existing flows.
+                ngram_input_ids = forward_batch.ngram_input_ids.reshape(-1, 3)
+                if ngram_input_ids.shape[0] == input_ids.shape[0]:
+                    ngram_embeds = self.embed_tokens(ngram_input_ids.reshape(-1)).view(
+                        -1, 3, self.config.hidden_size
+                    )
+                    embeds = ngram_embeds.mean(dim=1)
+                else:
+                    embeds = self.embed_tokens(input_ids)
+            else:
+                embeds = self.embed_tokens(input_ids)
         else:
             embeds = input_embeds
 

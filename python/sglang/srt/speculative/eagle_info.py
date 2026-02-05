@@ -620,6 +620,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     topk_index: torch.Tensor = None
     # shape: (b, hidden_size)
     hidden_states: torch.Tensor = None
+    # Optional ngram context ids for EAGLE3 custom logic, shape: (b, s, 3)
+    ngram_input_ids: torch.Tensor = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Inputs for extend
@@ -773,12 +775,16 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
+            if self.ngram_input_ids is not None:
+                self.ngram_input_ids = self.ngram_input_ids[: len(new_indices)]
             self.verified_id = self.verified_id[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
             self.hidden_states = self.hidden_states[new_indices]
+            if self.ngram_input_ids is not None:
+                self.ngram_input_ids = self.ngram_input_ids[new_indices]
             self.verified_id = self.verified_id[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
@@ -796,12 +802,19 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.verified_id = spec_info.verified_id
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
+            self.ngram_input_ids = spec_info.ngram_input_ids
             return
         if spec_info.hidden_states is None:
             return
         self.hidden_states = torch.cat(
             [self.hidden_states, spec_info.hidden_states], axis=0
         )
+        if self.ngram_input_ids is not None and spec_info.ngram_input_ids is not None:
+            self.ngram_input_ids = torch.cat(
+                [self.ngram_input_ids, spec_info.ngram_input_ids], axis=0
+            )
+        elif self.ngram_input_ids is None:
+            self.ngram_input_ids = spec_info.ngram_input_ids
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
