@@ -514,6 +514,7 @@ class EagleDraftWorker(BaseDraftWorker):
             return
 
         req_pool_indices = model_worker_batch.req_pool_indices.tolist()
+        seq_lens = model_worker_batch.seq_lens
         for i, req_pool_idx in enumerate(req_pool_indices):
             req_pool_idx = int(req_pool_idx)
             req_tokens = req_input_segments[i]
