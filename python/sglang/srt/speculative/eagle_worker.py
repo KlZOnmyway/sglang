@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -97,6 +97,7 @@ class EAGLEWorker(TpModelWorker):
         self.device = server_args.device
         self.target_worker = target_worker
         self.page_size = server_args.page_size
+        self.eagle3_prev_two_token_ids_by_req: Dict[int, torch.Tensor] = {}
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -522,6 +523,7 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def draft(self, batch: ScheduleBatch):
+        self._update_eagle3_req_token_history(batch)
         # Parse args
         if batch.forward_mode.is_idle():
             self._draft_preprocess_idle(batch)
@@ -631,10 +633,30 @@ class EAGLEWorker(TpModelWorker):
 
         # Forward multiple steps
         scores = None
+        ngram_prev_context = None
+        prev_step_input_ids_2d = None
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
+
+            if self.speculative_algorithm.is_eagle3():
+                selected_parent_indices = None
+                if i > 0:
+                    selected_parent_indices = (tree_info[2] - self.topk) % (self.topk**2)
+                    selected_parent_indices = selected_parent_indices // self.topk
+
+                ngram_input_ids, ngram_prev_context = self._build_eagle3_ngram_input_ids(
+                    input_ids=input_ids,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    prev_context=ngram_prev_context,
+                    selected_parent_indices=selected_parent_indices,
+                    prev_step_input_ids=prev_step_input_ids_2d,
+                )
+                spec_info.ngram_input_ids = ngram_input_ids
+                forward_batch.ngram_input_ids = ngram_input_ids
+                prev_step_input_ids_2d = input_ids.reshape(forward_batch.batch_size, -1)
+
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
@@ -675,6 +697,98 @@ class EAGLEWorker(TpModelWorker):
         )
 
         return parent_list, top_scores_index, draft_tokens
+
+    def _update_eagle3_req_token_history(self, batch: ScheduleBatch):
+        """Track the last 2 token ids for each request pool index."""
+        if (
+            not self.speculative_algorithm.is_eagle3()
+            or batch.forward_mode.is_idle()
+            or batch.req_pool_indices is None
+            or batch.input_ids is None
+        ):
+            return
+
+        bs = len(batch.req_pool_indices)
+        if bs == 0:
+            return
+
+        input_ids = batch.input_ids.to(torch.int64)
+        if input_ids.numel() == 0:
+            return
+
+        req_input_segments: List[torch.Tensor] = []
+        extend_lens = batch.extend_lens
+        if extend_lens is not None and len(extend_lens) == bs:
+            if sum(extend_lens) != input_ids.numel():
+                return
+            pt = 0
+            for seg_len in extend_lens:
+                req_input_segments.append(input_ids[pt : pt + seg_len])
+                pt += seg_len
+        elif input_ids.numel() == bs:
+            req_input_segments = list(input_ids.reshape(bs, 1))
+        else:
+            return
+
+        for i, req_pool_idx in enumerate(batch.req_pool_indices.tolist()):
+            req_pool_idx = int(req_pool_idx)
+            req_tokens = req_input_segments[i]
+            if req_tokens.numel() == 0:
+                continue
+
+            prev_two = self.eagle3_prev_two_token_ids_by_req.get(req_pool_idx)
+            if prev_two is None:
+                if req_tokens.numel() >= 2:
+                    prev_two = req_tokens[-2:].to(dtype=torch.int64)
+                else:
+                    prev_two = torch.tensor(
+                        [-1, req_tokens[-1]], dtype=torch.int64, device=input_ids.device
+                    )
+                self.eagle3_prev_two_token_ids_by_req[req_pool_idx] = prev_two
+                continue
+
+            prev_two = prev_two.to(device=input_ids.device, dtype=torch.int64)
+            for token_id in req_tokens:
+                prev_two = torch.stack([prev_two[1], token_id])
+            self.eagle3_prev_two_token_ids_by_req[req_pool_idx] = prev_two
+
+    def _build_eagle3_ngram_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        prev_context: Optional[torch.Tensor],
+        selected_parent_indices: Optional[torch.Tensor],
+        prev_step_input_ids: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build [B, S, 3] ngram ids in [t-2, t-1, t] format."""
+        bs = req_pool_indices.shape[0]
+        step_width = input_ids.numel() // bs
+        input_ids_2d = input_ids.reshape(bs, step_width)
+
+        if prev_context is None:
+            req_prev_two = []
+            for req_pool_idx in req_pool_indices.tolist():
+                req_prev_two.append(
+                    self.eagle3_prev_two_token_ids_by_req.get(
+                        int(req_pool_idx),
+                        torch.tensor([-1, -1], device=input_ids.device, dtype=torch.int64),
+                    )
+                )
+            req_prev_two = torch.stack(req_prev_two, dim=0).to(
+                device=input_ids.device, dtype=torch.int64
+            )
+            prev_context = req_prev_two.unsqueeze(1).repeat(1, step_width, 1)
+        else:
+            gather_idx = selected_parent_indices.unsqueeze(-1).expand(-1, -1, 2)
+            gathered_parent_context = torch.gather(prev_context, dim=1, index=gather_idx)
+            prev_context = torch.stack(
+                [gathered_parent_context[:, :, 1], prev_step_input_ids], dim=-1
+            )
+
+        ngram_input_ids = torch.cat(
+            [prev_context, input_ids_2d.unsqueeze(-1)], dim=-1
+        )
+        return ngram_input_ids, prev_context
 
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker
