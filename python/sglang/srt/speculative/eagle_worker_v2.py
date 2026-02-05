@@ -1,7 +1,7 @@
 import contextlib
 import logging
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -143,6 +143,7 @@ class EagleDraftWorker(BaseDraftWorker):
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
         self.eagle_use_aux_hidden_state = False
+        self.eagle3_prev_two_token_ids_by_req: Dict[int, torch.Tensor] = {}
         if self.speculative_algorithm.is_eagle3():
             eagle_config = getattr(
                 self.draft_runner.model_config.hf_config, "eagle_config", {}
@@ -294,6 +295,7 @@ class EagleDraftWorker(BaseDraftWorker):
             )
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
+        self._update_eagle3_req_token_history(model_worker_batch)
         draft_input: EagleDraftInput = model_worker_batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
@@ -398,10 +400,29 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Forward multiple steps
         scores = None
+        ngram_prev_context = None
+        prev_step_input_ids_2d = None
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
+
+            if self.speculative_algorithm.is_eagle3():
+                selected_parent_indices = None
+                if i > 0:
+                    selected_parent_indices = (tree_info[2] - self.topk) % (self.topk**2)
+                    selected_parent_indices = selected_parent_indices // self.topk
+
+                ngram_input_ids, ngram_prev_context = self._build_eagle3_ngram_input_ids(
+                    input_ids=input_ids,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    prev_context=ngram_prev_context,
+                    selected_parent_indices=selected_parent_indices,
+                    prev_step_input_ids=prev_step_input_ids_2d,
+                )
+                spec_info.ngram_input_ids = ngram_input_ids
+                prev_step_input_ids_2d = input_ids.reshape(forward_batch.batch_size, -1)
+
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
@@ -450,6 +471,122 @@ class EagleDraftWorker(BaseDraftWorker):
             parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
 
         return parent_list, top_scores_index, draft_tokens
+
+    def _update_eagle3_req_token_history(self, model_worker_batch: ModelWorkerBatch):
+        """Track the last 2 committed token ids for each request pool index.
+
+        Support decode, prefill/extend and mixed continuous batching.
+        """
+        if (
+            not self.speculative_algorithm.is_eagle3()
+            or model_worker_batch.forward_mode.is_idle()
+            or model_worker_batch.req_pool_indices is None
+        ):
+            return
+
+        bs = len(model_worker_batch.req_pool_indices)
+        if bs == 0:
+            return
+
+        if model_worker_batch.input_ids is None:
+            return
+
+        input_ids = model_worker_batch.input_ids.to(torch.int64)
+        if input_ids.numel() == 0:
+            return
+
+        # Build per-request token segments.
+        # - decode: each request has exactly 1 token
+        # - extend/mixed: use extend_seq_lens to split flattened input_ids
+        req_input_segments: List[torch.Tensor] = []
+        extend_seq_lens = model_worker_batch.extend_seq_lens
+        if extend_seq_lens is not None and len(extend_seq_lens) == bs:
+            if sum(extend_seq_lens) != input_ids.numel():
+                return
+            pt = 0
+            for seg_len in extend_seq_lens:
+                req_input_segments.append(input_ids[pt : pt + seg_len])
+                pt += seg_len
+        elif input_ids.numel() == bs:
+            req_input_segments = list(input_ids.reshape(bs, 1))
+        else:
+            return
+
+        req_pool_indices = model_worker_batch.req_pool_indices.tolist()
+        seq_lens = model_worker_batch.seq_lens
+        for i, req_pool_idx in enumerate(req_pool_indices):
+            req_pool_idx = int(req_pool_idx)
+            req_tokens = req_input_segments[i]
+            if req_tokens.numel() == 0:
+                continue
+
+            # Reset when there is no committed history before current request segment.
+            # `seq_lens[i]` is the total sequence length represented in this batch and
+            # `req_tokens.numel()` is the number of current-step input tokens for this req.
+            # If `seq_lens[i] - req_tokens.numel() <= 0`, there are no previous tokens,
+            # so we must not reuse any stale history from req-pool slot reuse.
+            num_prev_tokens = (
+                int(seq_lens[i]) - req_tokens.numel() if seq_lens is not None else None
+            )
+            if num_prev_tokens is not None and num_prev_tokens <= 0:
+                prev_two = torch.tensor(
+                    [-1, -1], dtype=torch.int64, device=input_ids.device
+                )
+            else:
+                prev_two = self.eagle3_prev_two_token_ids_by_req.get(req_pool_idx)
+                if prev_two is None:
+                    prev_two = torch.tensor(
+                        [-1, -1], dtype=torch.int64, device=input_ids.device
+                    )
+                else:
+                    prev_two = prev_two.to(device=input_ids.device, dtype=torch.int64)
+
+            for token_id in req_tokens:
+                prev_two = torch.stack([prev_two[1], token_id])
+
+            self.eagle3_prev_two_token_ids_by_req[req_pool_idx] = prev_two
+
+    def _build_eagle3_ngram_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        prev_context: Optional[torch.Tensor],
+        selected_parent_indices: Optional[torch.Tensor],
+        prev_step_input_ids: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Build [B, S, 3] input ids in [t-2, t-1, t] format without changing
+        the original 1D input_ids used by model forward.
+        """
+
+        bs = req_pool_indices.shape[0]
+        step_width = input_ids.numel() // bs
+        input_ids_2d = input_ids.reshape(bs, step_width)
+
+        if prev_context is None:
+            req_prev_two = []
+            for req_pool_idx in req_pool_indices.tolist():
+                req_prev_two.append(
+                    self.eagle3_prev_two_token_ids_by_req.get(
+                        int(req_pool_idx),
+                        torch.tensor([-1, -1], device=input_ids.device, dtype=torch.int64),
+                    )
+                )
+            req_prev_two = torch.stack(req_prev_two, dim=0).to(
+                device=input_ids.device, dtype=torch.int64
+            )
+            prev_context = req_prev_two.unsqueeze(1).repeat(1, step_width, 1)
+        else:
+            gather_idx = selected_parent_indices.unsqueeze(-1).expand(-1, -1, 2)
+            gathered_parent_context = torch.gather(prev_context, dim=1, index=gather_idx)
+            prev_context = torch.stack(
+                [gathered_parent_context[:, :, 1], prev_step_input_ids], dim=-1
+            )
+
+        ngram_input_ids = torch.cat(
+            [prev_context, input_ids_2d.unsqueeze(-1)], dim=-1
+        )
+        return ngram_input_ids, prev_context
 
     def draft_extend(self):
         pass
